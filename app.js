@@ -1,0 +1,812 @@
+/* Blossom Beauty Salon — public page: the reservas view and the salón view.
+   Services, prices, hours and free times come from core.js (Supabase or modo demo).
+   Mica changes them from her panel (admin.html), not here. */
+
+let DATA = null; // settings, categories, services, staff, exceptions, busy
+let SERVICES = [];
+let CATEGORIES = [];
+const PUBLIC_CACHE = "blossom-public-cache";
+
+/* ---------- currency ---------- */
+// Prices are charged in guaraníes; other currencies are shown as an approximation.
+const CURRENCIES = [
+  { code: "PYG", label: "Gs." },
+  { code: "USD", label: "US$" },
+  { code: "BRL", label: "R$" },
+  { code: "EUR", label: "€" },
+];
+// fallback rates (1 Gs. in each currency), 15/10/2026; live rates are cached for 12 hours
+let RATES = { PYG: 1, USD: 0.000175, BRL: 0.00088, EUR: 0.000156 };
+let currency = CURRENCIES.some((c) => c.code === saved.get("blossom-currency")) ? saved.get("blossom-currency") : "PYG";
+
+const convert = (pyg, code = currency) => {
+  const c = CURRENCIES.find((x) => x.code === code);
+  const v = (pyg * RATES[code]).toFixed(2).replace(".", ",").replace(/\B(?=(\d{3})+(?!\d))/g, ".");
+  return `${c.label} ${v}`;
+};
+const money = (pyg) => (currency === "PYG" ? gs(pyg) : "≈ " + convert(pyg));
+
+function paintPrices() {
+  $$("[data-pyg]").forEach((el) => { el.textContent = (el.dataset.prefix || "") + money(+el.dataset.pyg); });
+  $$(".cur-note").forEach((el) => { el.hidden = currency === "PYG"; });
+  $$(".cur-switch").forEach((sw) => {
+    const i = CURRENCIES.findIndex((c) => c.code === currency);
+    sw.style.setProperty("--i", i);
+    $$("button", sw).forEach((b, k) => { b.setAttribute("aria-checked", k === i); b.tabIndex = k === i ? 0 : -1; });
+  });
+  document.dispatchEvent(new Event("currencychange"));
+}
+
+function initCurrency() {
+  $$("[data-currency-switch]").forEach((box) => {
+    box.innerHTML = `<div class="cur-switch" role="radiogroup" aria-label="Ver precios en">
+        <span class="cur-thumb" aria-hidden="true"></span>
+        ${CURRENCIES.map((c) => `<button type="button" role="radio" data-cur="${c.code}" aria-label="${c.code}">${c.label}</button>`).join("")}
+      </div>
+      <p class="cur-note" hidden>Precios aproximados. Se cobra en guaraníes.</p>`;
+    box.addEventListener("keydown", (e) => {
+      if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(e.key)) return;
+      e.preventDefault();
+      const buttons = $$("[data-cur]", box);
+      const i = buttons.findIndex((b) => b.dataset.cur === currency);
+      const next = e.key === "Home" ? 0 : e.key === "End" ? buttons.length - 1
+        : (i + (e.key === "ArrowRight" ? 1 : -1) + buttons.length) % buttons.length;
+      buttons[next].click(); buttons[next].focus();
+    });
+    box.addEventListener("click", (e) => {
+      const b = e.target.closest("[data-cur]");
+      if (!b) return;
+      currency = b.dataset.cur;
+      saved.set("blossom-currency", currency);
+      paintPrices();
+    });
+  });
+  paintPrices();
+
+  const cached = saved.get("blossom-rates");
+  if (cached && Date.now() - cached.t < 12 * 3600e3) { RATES = { ...RATES, ...cached.rates }; paintPrices(); return; }
+  fetch("https://open.er-api.com/v6/latest/PYG")
+    .then((r) => r.json())
+    .then((d) => {
+      if (d.result !== "success") return;
+      const rates = { USD: d.rates.USD, BRL: d.rates.BRL, EUR: d.rates.EUR };
+      if (!Object.values(rates).every((v) => v > 0)) return;
+      RATES = { ...RATES, ...rates };
+      saved.set("blossom-rates", { t: Date.now(), rates });
+      paintPrices();
+    })
+    .catch(() => {});
+}
+
+const ICONS = {
+  plus: '<svg class="i-plus" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>',
+  check: '<svg class="i-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>',
+};
+
+/* ---------- open now, hours ---------- */
+function openStatus() {
+  const { key, minute } = nowInSalon();
+  const today = salonBlocks(DATA, key);
+  for (const [o, c] of today) {
+    if (minute >= o && minute < c) return { state: "open", text: `Abierto ahora · hasta las ${hhmm(c)}` };
+  }
+  const next = today.find(([o]) => o > minute);
+  if (next && today.some(([, c]) => c <= minute)) return { state: "break", text: `En pausa · volvemos a las ${hhmm(next[0])}` };
+  if (next) return { state: "closed", text: `Cerrado · abrimos hoy a las ${hhmm(next[0])}` };
+  for (let i = 1; i <= 14; i++) {
+    const k = addDays(key, i);
+    const b = salonBlocks(DATA, k);
+    if (b.length) {
+      const label = i === 1 ? "mañana" : i < 7 ? DAYS[dowOf(k)].toLowerCase() : `el ${DAYS[dowOf(k)].toLowerCase()} ${shortDate(k)}`;
+      return { state: "closed", text: `Cerrado · abrimos ${label} a las ${hhmm(b[0][0])}` };
+    }
+  }
+  return { state: "closed", text: "Cerrado" };
+}
+
+function renderStatus() {
+  if (!DATA) return;
+  const s = openStatus();
+  $$("[data-status]").forEach((el) => { el.dataset.state = s.state; el.textContent = s.text; });
+}
+
+function renderHours() {
+  const today = nowInSalon().day;
+  const hours = SETTINGS.hours;
+  $$("[data-hours]").forEach((ul) => {
+    ul.innerHTML = [1, 2, 3, 4, 5, 6, 0].map((d) => {
+      const txt = hours[d].length ? hours[d].map(([o, c]) => `${hhmm(o)}–${hhmm(c)}`).join(" · ") : "Cerrado";
+      return `<li class="${d === today ? "today" : ""}"><span>${DAYS[d]}</span><span>${txt}</span></li>`;
+    }).join("");
+  });
+  // "Lun a sáb · 08–12 y 14–19 h" when every open day has the same hours
+  const open = [1, 2, 3, 4, 5, 6, 0].filter((d) => hours[d].length);
+  if (open.length && open.every((d) => JSON.stringify(hours[d]) === JSON.stringify(hours[open[0]]))) {
+    const t = (m) => (m % 60 ? hhmm(m) : pad(m / 60));
+    const run = open.length > 2 && open.every((d, i) => !i || (d || 7) === (open[i - 1] || 7) + 1);
+    const days = run ? `${DAYS_SHORT[open[0]]} a ${DAYS_SHORT[open.at(-1)].toLowerCase()}` : open.map((d) => DAYS_SHORT[d]).join(", ");
+    $$("[data-hours-summary]").forEach((el) => { el.textContent = `${days} · ${hours[open[0]].map(([o, c]) => `${t(o)}–${t(c)}`).join(" y ")} h`; });
+  }
+}
+
+// buttons to her Google review form, so clients review on their own (hidden until the link is set)
+function renderReviews() {
+  $$("[data-review]").forEach((a) => {
+    a.hidden = !SETTINGS.review_url;
+    if (SETTINGS.review_url) { a.href = SETTINGS.review_url; a.target = "_blank"; a.rel = "noopener"; }
+  });
+}
+
+// salon rules from the panel, one per line; "Puntualidad: texto" puts the title in bold
+function policyItems() {
+  return String(SETTINGS.policies_text || "").split("\n").map((l) => l.trim()).filter(Boolean).map((l) => {
+    const m = l.match(/^([^:]{2,30}):\s*(.+)$/);
+    return `<li>${m ? `<b>${esc(m[1])}:</b> ${esc(m[2])}` : esc(l)}</li>`;
+  }).join("");
+}
+function renderPolicies() {
+  const items = policyItems();
+  const box = $("#policies");
+  if (box) { box.hidden = !items; box.innerHTML = items ? `<b>Antes de reservar</b><ul class="policy-list">${items}</ul>` : ""; }
+  $$("[data-policies-faq]").forEach((d) => { d.hidden = !items; });
+  $$("[data-policies]").forEach((ul) => { ul.innerHTML = items; });
+}
+
+function wireWhatsAppLinks() {
+  $$("[data-wa]").forEach((a) => {
+    a.href = waLink(a.dataset.wa || "¡Hola Mica! Vengo desde la web de Blossom 🌸");
+    a.target = "_blank"; a.rel = "noopener";
+  });
+}
+
+/* =========================================================
+   RESERVAS view
+   ========================================================= */
+const cartStore = {
+  get() { try { return JSON.parse(sessionStorage.getItem("blossom-cart") || "[]"); } catch { return []; } },
+  set(v) { try { sessionStorage.setItem("blossom-cart", JSON.stringify(v)); } catch {} },
+};
+// the visitor's name, phone and bookings, remembered on her phone so she doesn't type them again
+const me = {
+  get: () => saved.get("blossom-me") || { bookings: [] },
+  set: (v) => saved.set("blossom-me", v),
+};
+
+let renderCatalog = () => {};
+let renderMe = () => {};
+
+function initReservas() {
+  const list = $("#services");
+  if (!list) return;
+
+  let cart = cartStore.get();
+  let extras = []; // add-on ids picked in the sheet
+  const booking = { staff: null, day: null, slot: null };
+  const svc = (id) => SERVICES.find((s) => s.id === id);
+
+  renderCatalog = () => {
+    cart = cart.filter((id) => svc(id));
+    const cats = CATEGORIES.filter((c) => SERVICES.some((s) => s.category_id === c.id));
+    const other = SERVICES.filter((s) => !cats.some((c) => c.id === s.category_id));
+    if (other.length) cats.push({ id: "otros", name: "Otros" });
+    $("#chips").innerHTML = cats.map((c) => `<a class="chip" href="#cat-${esc(c.id)}">${esc(c.name)}</a>`).join("");
+    list.innerHTML = cats.map((c) => {
+      const items = (c.id === "otros" ? other : SERVICES.filter((s) => s.category_id === c.id)).map((s) => `
+        <li class="svc" data-id="${esc(s.id)}">
+          ${s.image
+            ? `<img class="thumb" src="${esc(s.image)}" alt="" loading="lazy" width="76" height="76">`
+            : `<div class="thumb-ph" aria-hidden="true"><svg class="sparkle"><use href="#i-sparkle"/></svg></div>`}
+          <div>
+            <p class="name">${esc(s.name)}</p>
+            ${s.description ? `<p class="desc">${esc(s.description)}</p>` : ""}
+            <div class="meta">
+              <span class="price"${s.price ? ` data-pyg="${s.price}"` : ""}>${s.price ? money(s.price) : "Consultar"}</span>
+              ${s.duration ? `<span class="dur">· ${dur(s.duration)}</span>` : ""}
+            </div>
+          </div>
+          <button class="add" type="button" aria-pressed="false" aria-label="Agregar ${esc(s.name)}">${ICONS.plus}${ICONS.check}</button>
+        </li>`).join("");
+      return `<section class="cat" id="cat-${esc(c.id)}" aria-labelledby="h-${esc(c.id)}"><h3 id="h-${esc(c.id)}">${esc(c.name)}</h3><ul class="svc-list">${items}</ul></section>`;
+    }).join("");
+
+    // highlight the chip of the category in view
+    const chips = $$("#chips .chip");
+    io.disconnect();
+    io = new IntersectionObserver((entries) => {
+      entries.forEach((en) => {
+        if (!en.isIntersecting) return;
+        chips.forEach((c) => c.setAttribute("aria-current", c.getAttribute("href") === "#" + en.target.id));
+        const active = chips.find((c) => c.getAttribute("href") === "#" + en.target.id);
+        if (active) {
+          const row = $("#chips");
+          row.scrollTo({ left: active.offsetLeft - row.clientWidth / 2 + active.offsetWidth / 2, behavior: motion() });
+        }
+      });
+    }, { rootMargin: "-45% 0px -50% 0px" });
+    $$(".cat").forEach((s) => io.observe(s));
+    sync();
+  };
+  let io = new IntersectionObserver(() => {});
+
+  list.addEventListener("click", (e) => {
+    const btn = e.target.closest(".add");
+    if (!btn) return;
+    const id = btn.closest(".svc").dataset.id;
+    if (cart.includes(id)) { cart = cart.filter((x) => x !== id); }
+    else { cart.push(id); toast(`${svc(id).name} agregado ✓`); }
+    sync();
+  });
+
+  // ---- cart bar + sheet ----
+  const bar = $("#cartbar"), idle = $("#idlebar");
+  const sheet = $("#sheet"), root = document.documentElement;
+  const focus = modalFocus(sheet);
+
+  function totals() {
+    const items = cart.map(svc);
+    const offered = addonsFor(DATA, cart);
+    const adds = extras.map((id) => offered.find((a) => a.id === id)).filter(Boolean);
+    const def = SETTINGS.default_duration;
+    const extraPrice = adds.reduce((a, x) => a + x.price, 0), extraMin = adds.reduce((a, x) => a + (x.duration || 0), 0);
+    const price = items.reduce((a, s) => a + (s.price || 0), 0) + extraPrice;
+    return {
+      items, adds, price,
+      need: items.reduce((a, s) => a + (s.duration || def), 0) + extraMin,
+      known: items.reduce((a, s) => a + (s.duration || 0), 0) + extraMin,
+      unknown: items.some((s) => !s.price),
+      unknownDuration: items.some((s) => !s.duration),
+      deposit: depositFor(SETTINGS, price),
+    };
+  }
+
+  function sync() {
+    if (!DATA) return; // the catalogue hasn't loaded yet
+    cartStore.set(cart);
+    extras = extras.filter((id) => addonsFor(DATA, cart).some((a) => a.id === id));
+    $$(".svc").forEach((li) => {
+      const on = cart.includes(li.dataset.id);
+      li.classList.toggle("is-added", on);
+      $(".add", li).setAttribute("aria-pressed", on);
+      $(".add", li).setAttribute("aria-label", `${on ? "Quitar" : "Agregar"} ${svc(li.dataset.id).name}`);
+    });
+    const t = totals();
+    const n = cart.length;
+    bar.classList.toggle("show", n > 0);
+    idle.classList.toggle("show", n === 0);
+    bar.inert = n === 0;
+    idle.inert = n > 0;
+    $("#bar-count").textContent = `${n} servicio${n === 1 ? "" : "s"}`;
+    $("#bar-detail").textContent = [t.price ? money(t.price) + (t.unknown ? " + consultar" : "") : "A consultar", t.known ? dur(t.known) : ""].filter(Boolean).join(" · ");
+    if (root.classList.contains("sheet-open") && !$("#sheet-form").hidden) renderSheet();
+    if (!n && root.classList.contains("sheet-open") && !$("#sheet-form").hidden) closeSheet();
+  }
+
+  // who can do everything in the cart
+  // who does what: one person, or several one after another (nails with Mica, then hair with Lore)
+  function cartPlan() {
+    const { groups, missing } = splitCart(DATA, cart);
+    return { parts: cartParts(DATA, groups, extras), missing };
+  }
+  const shortName = (st) => st.name.trim().split(" ")[0];
+
+  function renderSheet() {
+    const t = totals();
+    $("#picked").innerHTML = t.items.map((s) => `
+      <li><span>${esc(s.name)}</span><span class="p">${s.price ? money(s.price) : "Consultar"}</span>
+      <button class="rm" type="button" data-rm="${esc(s.id)}" aria-label="Quitar ${esc(s.name)}">×</button></li>`).join("");
+    $("#tot-price").textContent = t.price ? money(t.price) + (t.unknown ? " + consultar" : "") : "A consultar";
+    $("#tot-min").textContent = t.unknownDuration ? `aprox. ${dur(t.need)}` : dur(t.need);
+
+    // extras that go with these services (francesitas, largor...)
+    const offered = addonsFor(DATA, cart);
+    $("#addons-step").hidden = !offered.length;
+    $("#addon-pills").innerHTML = offered.map((a) => `
+      <button type="button" class="pill addon" data-addon="${esc(a.id)}" aria-pressed="${extras.includes(a.id)}">${esc(a.name)}<small>+ ${money(a.price)}</small></button>`).join("");
+    const dep = $("#deposit-note");
+    dep.hidden = !t.deposit;
+    dep.innerHTML = t.deposit ? `<b>Seña para confirmar: ${money(t.deposit)}</b><small>Al enviar la reserva te mostramos los datos para transferir. También podés pagar con tarjeta o QR. Si no venís al turno, la seña no se devuelve.</small>` : "";
+
+    // professionals: asked only when one person does everything and there's a choice
+    const { parts, missing } = cartPlan();
+    const choice = parts.length === 1 ? parts[0].staff : [];
+    if (booking.staff && !choice.some((p) => p.id === booking.staff)) booking.staff = null;
+    $("#staff-step").hidden = choice.length < 2;
+    $("#staff-pills").innerHTML = [{ id: "", name: "Cualquiera" }, ...choice].map((p) => `
+      <button type="button" class="pill" data-staff="${esc(p.id)}" aria-pressed="${(booking.staff || "") === p.id}">${esc(p.name)}${p.role ? `<small>${esc(p.role)}</small>` : ""}</button>`).join("");
+    // several professionals: say who does what
+    const who = $("#who-note");
+    who.hidden = parts.length < 2;
+    who.innerHTML = parts.length < 2 ? "" : `Te atienden ${parts.map((p) =>
+      `<b>${esc(p.staff.map(shortName).join(" o "))}</b> (${esc(p.service_ids.map((id) => svc(id).name).join(", "))})`).join(" y ")}, una después de la otra.`;
+
+    // days with free times; full days stay visible but disabled
+    const now = nowInSalon();
+    const days = [];
+    const involved = [...new Set(parts.flatMap((p) => p.staff))];
+    for (let i = 0; !missing.length && i <= SETTINGS.booking_days; i++) {
+      const key = addDays(now.key, i);
+      if (!involved.some((st) => blocksFor(DATA, st, key).length)) continue;
+      const starts = cartStarts(DATA, parts, key, { staffPick: booking.staff, now });
+      if (i === 0 && !starts.length) continue;
+      days.push({ key, i, starts });
+    }
+    if (booking.day && !days.some((d) => d.key === booking.day && d.starts.length)) { booking.day = null; booking.slot = null; }
+    $("#days").innerHTML = days.length ? days.map((d) => `<button type="button" class="pill pill-day" data-day="${d.key}" aria-pressed="${booking.day === d.key}"${d.starts.length ? "" : " disabled"}>
+        ${d.i === 0 ? "Hoy" : d.i === 1 ? "Mañana" : DAYS_SHORT[dowOf(d.key)]}<small>${d.starts.length ? shortDate(d.key) : "Completo"}</small></button>`).join("")
+      : missing.length ? "" : `<p class="slot-note">No hay días con horario disponible en las próximas semanas.</p>`;
+
+    const slotsEl = $("#slots"), note = $("#slot-note");
+    note.textContent = "";
+    if (missing.length) {
+      slotsEl.innerHTML = "";
+      note.textContent = `${missing.map((id) => `«${svc(id).name}»`).join(", ")} todavía no se puede reservar online. Escribile a Mica y lo coordinan.`;
+    } else if (!booking.day) {
+      slotsEl.innerHTML = `<p class="slot-note">${days.some((d) => d.starts.length) ? "Elegí un día para ver los horarios libres." : "No quedan horarios libres para esta combinación. Escribile a Mica y lo coordinan."}</p>`;
+    } else {
+      const starts = days.find((d) => d.key === booking.day).starts;
+      if (!starts.includes(booking.slot)) booking.slot = null;
+      const groups = [["Mañana", starts.filter((m) => m < 720)], ["Tarde", starts.filter((m) => m >= 720)]];
+      slotsEl.innerHTML = groups.filter(([, g]) => g.length).map(([label, g]) => `<div class="slot-group">${label}</div><div class="pills">${g.map((m) =>
+        `<button type="button" class="pill" data-slot="${m}" aria-pressed="${booking.slot === m}">${hhmm(m)}</button>`).join("")}</div>`).join("");
+      note.textContent = t.unknownDuration
+        ? "Lo que es a consultar lo calculamos en 1 hora; Mica te avisa si hace falta más tiempo."
+        : parts.length > 1 ? `Solo mostramos horarios en los que entran los turnos seguidos (${dur(t.need)} en total).`
+          : `Solo mostramos horarios libres para tus ${dur(t.need)} de servicio.`;
+    }
+    $("#book").setAttribute("aria-disabled", !(booking.day && booking.slot != null));
+    paintLinks();
+  }
+
+  function openSheet() {
+    const m = me.get();
+    if (!$("#name").value && m.name) $("#name").value = m.name;
+    if (!$("#phone").value && m.phone) $("#phone").value = fmtPhone(m.phone);
+    showForm();
+    renderSheet();
+    root.classList.add("sheet-open");
+    focus.open();
+    // a history entry for the sheet, so the phone's Back button closes it instead of leaving the page
+    if (!history.state?.sheet) try { history.pushState({ sheet: true }, ""); } catch {}
+    setTimeout(() => $("#sheet .close").focus(), 50);
+    // fetch fresh free times while she chooses
+    loadData().then(() => { if (root.classList.contains("sheet-open") && !$("#sheet-form").hidden) renderSheet(); }).catch(() => {});
+  }
+  function closeSheet({ fromHistory = false } = {}) {
+    root.classList.remove("sheet-open");
+    focus.close();
+    if (!$("#sheet-done").hidden) showForm();
+    (cart.length ? $("#open-sheet") : $(".add"))?.focus({ preventScroll: true });
+    if (!fromHistory && history.state?.sheet) history.back();
+  }
+  addEventListener("popstate", () => {
+    if (root.classList.contains("sheet-open") && !history.state?.sheet) closeSheet({ fromHistory: true });
+  });
+  // after a reload the entry is still there with the sheet closed: forget it
+  if (history.state?.sheet) try { history.replaceState(null, ""); } catch {}
+  function showForm() {
+    $("#sheet-form").hidden = false;
+    $("#sheet-done").hidden = true;
+    $("#sheet-title").textContent = "Tu reserva";
+    $("#book-error").hidden = true;
+    $$(".field-error", sheet).forEach((x) => { x.hidden = true; });
+    $$("[aria-invalid]", sheet).forEach((x) => x.removeAttribute("aria-invalid"));
+  }
+
+  $("#open-sheet").addEventListener("click", openSheet);
+  $("#sheet-backdrop").addEventListener("click", closeSheet);
+  $("#sheet .close").addEventListener("click", closeSheet);
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape" && root.classList.contains("sheet-open")) closeSheet(); });
+
+  sheet.addEventListener("click", (e) => {
+    const rm = e.target.closest("[data-rm]");
+    if (rm) { cart = cart.filter((x) => x !== rm.dataset.rm); sync(); return; }
+    const ad = e.target.closest("[data-addon]");
+    if (ad) {
+      const id = ad.dataset.addon;
+      extras = extras.includes(id) ? extras.filter((x) => x !== id) : [...extras, id];
+      renderSheet();
+      $(`[data-addon="${id}"]`, sheet)?.focus({ preventScroll: true });
+      return;
+    }
+    const st = e.target.closest("[data-staff]");
+    if (st) { booking.staff = st.dataset.staff || null; renderSheet(); $(`[data-staff="${st.dataset.staff}"]`, sheet).focus({ preventScroll: true }); return; }
+    const day = e.target.closest("[data-day]");
+    if (day) {
+      booking.day = day.dataset.day; booking.slot = null; renderSheet();
+      $(`[data-day="${booking.day}"]`, sheet).focus({ preventScroll: true });
+      return;
+    }
+    const slot = e.target.closest("[data-slot]");
+    if (slot) {
+      booking.slot = +slot.dataset.slot; renderSheet();
+      $(`[data-slot="${booking.slot}"]`, sheet).focus({ preventScroll: true });
+      return;
+    }
+    if (e.target.closest("#done-close")) closeSheet();
+    const copy = e.target.closest("[data-copy]");
+    if (copy) {
+      navigator.clipboard?.writeText(copy.dataset.copy).then(() => { copy.textContent = "¡Copiado!"; }).catch(() => {});
+    }
+  });
+
+  // The message Mica got before the agenda existed: she answers it to confirm the turn.
+  function waMessage() {
+    const t = totals();
+    const name = $("#name").value.trim();
+    const notes = $("#notes").value.trim();
+    const day = booking.day ? `${DAYS[dowOf(booking.day)].toLowerCase()} ${shortDate(booking.day)}` : "a coordinar";
+    const time = booking.day && booking.slot != null ? `${hhmm(booking.slot)} hs` : "a coordinar";
+    return [
+      `¡Hola Mica! 🌸${name ? ` Soy ${name}.` : ""} Quiero reservar:`,
+      ...t.items.map((s) => `• ${s.name} (${s.price ? gs(s.price) : "consultar precio"})`),
+      ...t.adds.map((a) => `• + ${a.name} (${gs(a.price)})`),
+      "",
+      `Total estimado: ${t.price ? gs(t.price) + (currency !== "PYG" ? ` (≈ ${convert(t.price)})` : "") : "a consultar"}${t.price && t.unknown ? " + servicios a consultar" : ""}${t.known ? ` · ${dur(t.known)}` : ""}`,
+      `📅 Día: ${day}`,
+      `🕐 Horario: ${time}`,
+      ...(t.deposit ? [`💳 Seña: ${gs(t.deposit)}`] : []),
+      ...(notes ? [`📝 ${notes}`] : []),
+      "",
+      "¿Tenés disponible? ¡Gracias!",
+    ].join("\n");
+  }
+  // both buttons are real links (window.open after a wait gets blocked), rebuilt whenever the booking changes
+  function paintLinks() {
+    const href = waLink(waMessage());
+    $("#book").href = href;
+    $("#wa-instead").href = href;
+    return href;
+  }
+  // the field's error goes away as soon as she starts fixing it
+  for (const f of ["#name", "#phone"]) {
+    $(f).addEventListener("input", () => { $(f).removeAttribute("aria-invalid"); $(`${f}-error`).hidden = true; });
+  }
+  $("#name").addEventListener("input", paintLinks);
+  $("#notes").addEventListener("input", paintLinks);
+
+  // ---- send: one tap saves the turn in Mica's agenda and opens WhatsApp with the message ----
+  let sending = false;
+  $("#book").addEventListener("click", (e) => {
+    const err = $("#book-error");
+    const name = $("#name").value.trim();
+    const phone = normPhone($("#phone").value);
+    // a problem with a field shows right under it, where she is looking once the keyboard opens
+    const stop = (msg, field) => {
+      e.preventDefault();
+      if (!field) { err.textContent = msg; err.hidden = false; err.scrollIntoView({ block: "nearest", behavior: motion() }); return; }
+      const box = $(`${field}-error`);
+      box.textContent = msg; box.hidden = false;
+      $(field).setAttribute("aria-invalid", "true");
+      $(field).focus();
+      box.scrollIntoView({ block: "nearest", behavior: motion() });
+    };
+    if (sending) return e.preventDefault();
+    if (!(booking.day && booking.slot != null)) return stop("Elegí un día y un horario.");
+    if (!name) return stop("Escribí tu nombre.", "#name");
+    if (phone.length < 8 || phone.length > 15) return stop("Revisá tu número de WhatsApp, por ejemplo 0981 123 456.", "#phone");
+    if (!DB_NOW) return stop("Un segundo, todavía estamos cargando. Probá de nuevo.");
+    err.hidden = true;
+    const href = paintLinks(); // the link opens WhatsApp as soon as this handler returns
+    const t = totals();
+    // who takes each part at that time (the database checks it again)
+    const plan = placeParts(DATA, cartPlan().parts, booking.day, booking.slot, { staffPick: booking.staff });
+    if (!plan) return stop("Ese horario se acaba de ocupar. Elegí otro, por favor.");
+    const req = { plan, date: booking.day, start: booking.slot, name, phone, notes: $("#notes").value.trim() };
+    sending = true;
+    $("#book").classList.add("is-busy");
+    // sent right here, not after an await, so it leaves before the phone switches to WhatsApp
+    let saving;
+    try { saving = DB_NOW.bookGroup(req); } catch (x) { saving = Promise.reject(x); }
+    saving.then((res) => {
+      const m = me.get();
+      m.name = name; m.phone = phone;
+      m.bookings = [...(m.bookings || []), {
+        id: res.id, staff_id: res.staff_id, date: res.date, start_min: res.start_min, end_min: res.end_min,
+        names: [...t.items, ...t.adds].map((s) => s.name),
+      }].slice(-20);
+      me.set(m);
+      showDone(res, name, t, href);
+      loadData().catch(() => {});
+    }).catch(async (x) => {
+      // without connection the browser answers in English ("Failed to fetch", "Load failed")
+      let msg = x instanceof TypeError || !x.message ? "No pudimos guardar el turno. Revisá tu conexión." : x.message;
+      if (!/[.!?]$/.test(msg)) msg += ".";
+      err.textContent = `${msg} Si ya le mandaste el mensaje, Mica te responde igual por WhatsApp.`;
+      err.hidden = false;
+      await loadData().catch(() => {});
+      renderSheet();
+    }).finally(() => {
+      sending = false;
+      $("#book").classList.remove("is-busy");
+    });
+  });
+
+  function showDone(res, name, t, href) {
+    const who = DATA.staff.find((s) => s.id === res.staff_id);
+    const pending = res.status === "pending";
+    const first = esc(name.split(" ")[0]);
+    const deposit = res.deposit_due ?? t.deposit;
+    $("#sheet-title").textContent = pending ? "¡Lugar guardado!" : "¡Turno reservado!";
+    $("#sheet-done").innerHTML = `
+      <div class="done-mark" aria-hidden="true"><svg class="sparkle"><use href="#i-sparkle"/></svg></div>
+      <p class="done-lead">${pending
+        ? `Gracias, ${first}. Te guardamos el lugar: mandale el mensaje a Mica por WhatsApp y ella te confirma el turno.`
+        : `¡Listo, ${first}! Te esperamos.`}</p>
+      <div class="done-card">
+        <strong>${longDate(res.date)} · ${hhmm(res.start_min)} hs</strong>
+        <span>${[...t.items, ...t.adds].map((s) => esc(s.name)).join(" · ")}</span>
+        <span class="muted">${(res.segments || []).length > 1
+          ? res.segments.map((sg) => `${hhmm(sg.start_min)} con ${esc(shortName(DATA.staff.find((x) => x.id === sg.staff_id) || { name: "" }))}`).join(" · ") + " · "
+          : who && DATA.staff.length > 1 ? `con ${esc(who.name)} · ` : ""}${t.unknownDuration ? "aprox. " : ""}${dur(res.end_min - res.start_min)}</span>
+        <span class="price">${t.price ? gs(t.price) + (t.unknown ? " + consultar" : "") : "Precio a consultar"}</span>
+      </div>
+      ${deposit ? `<div class="pay-box">
+        <b>Seña para confirmar: ${gs(deposit)}</b>
+        ${SETTINGS.payment_info ? `<p>${esc(SETTINGS.payment_info).replace(/\n/g, "<br>")}</p>
+        <button class="btn btn-ghost sm-copy" type="button" data-copy="${esc(SETTINGS.payment_info)}">Copiar datos</button>` : ""}
+        <small>Mandale el comprobante a Mica por WhatsApp. Si preferís pagar con tarjeta de crédito, débito o QR, pedile los datos por ahí.</small>
+      </div>` : ""}
+      <a class="btn btn-wa send" href="${href}" target="_blank" rel="noopener"><svg><use href="#i-wa"/></svg>Enviar el mensaje a Mica</a>
+      <button class="btn btn-ghost send" id="done-close" type="button">Listo</button>
+      <p class="fine">Si WhatsApp no se abrió solo, tocá el botón verde. Para cambiar o cancelar, escribile a Mica.</p>`;
+    $("#sheet-form").hidden = true;
+    $("#sheet-done").hidden = false;
+    $("#sheet-done").focus();
+    sheet.scrollTop = 0;
+    // the booking is done: start fresh even if she leaves without tapping "Listo"
+    cart = []; extras = []; booking.day = booking.slot = null;
+    $("#notes").value = "";
+    sync();
+    renderMe();
+  }
+
+  // ---- "tu próximo turno" / "¿volvés?" card ----
+  renderMe = () => {
+    const box = $("#me-card");
+    const m = me.get();
+    const now = nowInSalon();
+    // a booking Mica cancelled no longer shows up among the taken times
+    const live = (b) => (DATA.busy || []).some((x) => x.staff_id === b.staff_id && x.date === b.date && x.start_min === b.start_min);
+    const next = (m.bookings || [])
+      .filter((b) => (b.date > now.key || (b.date === now.key && b.end_min > now.minute)) && live(b))
+      .sort((a, b) => a.date.localeCompare(b.date) || a.start_min - b.start_min)[0];
+    const last = (m.bookings || []).filter((b) => b.date < now.key).map((b) => b.date).sort().at(-1);
+    const first = esc((m.name || "").split(" ")[0]);
+    const review = SETTINGS.review_url && last && m.reviewed !== last && daysBetween(last, now.key) <= 14;
+    if (next) {
+      box.innerHTML = `<div class="me-card">
+        <span class="eyebrow"><svg class="sparkle"><use href="#i-sparkle"/></svg>Tu próximo turno</span>
+        <strong>${longDate(next.date)} · ${hhmm(next.start_min)} hs</strong>
+        <small>${esc(next.names.join(" · "))}</small>
+        <a class="link" href="${waLink(`¡Hola Mica! 🌸 Soy ${m.name}. Te escribo por mi turno del ${DAYS[dowOf(next.date)].toLowerCase()} ${shortDate(next.date)} a las ${hhmm(next.start_min)}.`)}" target="_blank" rel="noopener">¿Cambiar o cancelar? Escribile a Mica</a>
+      </div>`;
+    } else if (review) {
+      // she came in the last two weeks: ask for the review here instead of by WhatsApp
+      box.innerHTML = `<div class="me-card">
+        <span class="eyebrow"><svg class="sparkle"><use href="#i-sparkle"/></svg>${first ? `¡Gracias por venir, ${first}!` : "¡Gracias por venir!"}</span>
+        <strong>¿Cómo te quedó?</strong>
+        <small>Si te gustó, dejanos una reseña en Google. Nos ayuda a que más gente nos encuentre.</small>
+        <a class="btn btn-rose sm" href="${esc(SETTINGS.review_url)}" target="_blank" rel="noopener" data-reviewed="${last}"><span class="star" aria-hidden="true">★</span>Dejar mi reseña</a>
+      </div>`;
+      $("[data-reviewed]", box).addEventListener("click", () => { me.set({ ...me.get(), reviewed: last }); setTimeout(renderMe, 400); });
+    } else if (last && daysBetween(last, now.key) >= SETTINGS.reminder_days) {
+      box.innerHTML = `<div class="me-card">
+        <span class="eyebrow"><svg class="sparkle"><use href="#i-sparkle"/></svg>${first ? `¡Hola, ${first}!` : "¡Hola!"}</span>
+        <strong>Ya pasaron ${daysBetween(last, now.key)} días desde tu último turno</strong>
+        <small>¿Reservamos tu retoque? Elegí tus servicios acá abajo.</small>
+      </div>`;
+    } else box.innerHTML = "";
+  };
+
+  let toastTimer;
+  function toast(msg) {
+    const el = $("#toast");
+    el.textContent = msg;
+    el.classList.add("show");
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => el.classList.remove("show"), 1600);
+  }
+
+  document.addEventListener("currencychange", sync);
+}
+
+/* =========================================================
+   SALÓN view
+   ========================================================= */
+// "¿Cómo puedo pagar?": shows her transfer details once they're set in the panel
+function renderPayFaq() {
+  const el = $("[data-pay-faq]");
+  if (!el || !SETTINGS.payment_info) return;
+  el.innerHTML = `Por transferencia, con tarjeta de crédito o débito, o con QR.<br><br><b>Para transferir:</b><br>${esc(SETTINGS.payment_info).replace(/\n/g, "<br>")}<br><br>Para pagar con tarjeta o QR, pedile los datos a Mica por WhatsApp.`;
+}
+
+// photos of her work: from the panel (gallery table), the starting set until it loads
+let PHOTOS = SEED.gallery;
+function renderGallery() {
+  const g = $("#gallery");
+  if (!g) return;
+  PHOTOS = [...(DATA?.gallery || SEED.gallery)].filter((p) => p.active !== false).sort((a, b) => a.sort - b.sort);
+  g.innerHTML = PHOTOS.map((p, i) =>
+    `<button type="button" data-i="${i}" aria-label="Ver foto${p.caption ? ": " + esc(p.caption) : ""}"><img src="${esc(p.image)}" alt="${esc(p.caption || "Trabajo de Blossom")}" loading="lazy"></button>`).join("");
+}
+
+// category cards with "Desde Gs. X"
+function renderCategoryCards() {
+  const box = $("#cat-cards");
+  if (!box) return;
+  box.innerHTML = CATEGORIES.filter((c) => SERVICES.some((s) => s.category_id === c.id)).map((c) => {
+    const prices = SERVICES.filter((s) => s.category_id === c.id && s.price).map((s) => s.price);
+    const from = prices.length ? `<p data-prefix="Desde " data-pyg="${Math.min(...prices)}"></p>` : "<p>Precio por WhatsApp</p>";
+    return `<a class="cat-card${c.image ? "" : " ph"}" href="#cat-${esc(c.id)}">${c.image ? `<img src="${esc(c.image)}" alt="" loading="lazy">` : ""}<div class="txt"><h3>${esc(c.name)}</h3>${from}</div></a>`;
+  }).join("");
+  paintPrices();
+}
+
+function initSalon() {
+  const nav = $(".nav");
+  if (nav) {
+    const onScroll = () => nav.classList.toggle("scrolled", scrollY > 8);
+    addEventListener("scroll", onScroll, { passive: true }); onScroll();
+  }
+
+  initMicaSlider();
+
+  const g = $("#gallery");
+  if (!g) return;
+  renderGallery();
+
+  const lb = $("#lightbox"), img = $("img", lb), cap = $("figcaption", lb);
+  const focus = modalFocus(lb);
+  let cur = 0;
+  const show = (i) => {
+    cur = (i + PHOTOS.length) % PHOTOS.length;
+    img.src = PHOTOS[cur].image; img.alt = PHOTOS[cur].caption || ""; cap.textContent = PHOTOS[cur].caption || "";
+  };
+  const close = () => { lb.classList.remove("open"); focus.close(); };
+  g.addEventListener("click", (e) => {
+    const b = e.target.closest("button"); if (!b) return;
+    show(+b.dataset.i); lb.classList.add("open"); focus.open(); $(".lb-close", lb).focus();
+  });
+  $(".lb-close", lb).addEventListener("click", close);
+  $(".lb-prev", lb).addEventListener("click", () => show(cur - 1));
+  $(".lb-next", lb).addEventListener("click", () => show(cur + 1));
+  lb.addEventListener("click", (e) => { if (e.target === lb) close(); });
+  document.addEventListener("keydown", (e) => {
+    if (!lb.classList.contains("open")) return;
+    if (e.key === "Escape") close();
+    if (e.key === "ArrowLeft") show(cur - 1);
+    if (e.key === "ArrowRight") show(cur + 1);
+  });
+  let x0 = null;
+  lb.addEventListener("touchstart", (e) => { x0 = e.touches[0].clientX; }, { passive: true });
+  lb.addEventListener("touchend", (e) => {
+    if (x0 === null) return;
+    const dx = e.changedTouches[0].clientX - x0;
+    if (Math.abs(dx) > 40) show(cur + (dx < 0 ? 1 : -1));
+    x0 = null;
+  });
+}
+
+// "Sobre mí" photo slider. On wide screens it takes the height of the text next to it.
+function initMicaSlider() {
+  const slider = $(".mica-slider");
+  if (!slider) return;
+  const track = $(".ms-track", slider);
+  const slides = $$(".ms-slide", slider);
+  const dots = $(".ms-dots", slider);
+  dots.innerHTML = slides.map((_, i) => `<button type="button" aria-label="Foto ${i + 1}"></button>`).join("");
+  const dotBtns = $$("button", dots);
+
+  const current = () => Math.round(track.scrollLeft / track.clientWidth);
+  const go = (i) => track.scrollTo({ left: ((i + slides.length) % slides.length) * track.clientWidth, behavior: motion() });
+  const paint = () => dotBtns.forEach((d, i) => d.setAttribute("aria-current", i === current()));
+  track.addEventListener("scroll", () => requestAnimationFrame(paint), { passive: true });
+  dotBtns.forEach((d, i) => d.addEventListener("click", () => { stop(); go(i); }));
+  $(".ms-prev", slider).addEventListener("click", () => { stop(); go(current() - 1); });
+  $(".ms-next", slider).addEventListener("click", () => { stop(); go(current() + 1); });
+  track.addEventListener("keydown", (e) => {
+    if (e.key === "ArrowRight") { stop(); go(current() + 1); }
+    if (e.key === "ArrowLeft") { stop(); go(current() - 1); }
+  });
+  paint();
+
+  // gentle autoplay until the visitor touches it
+  let timer = null;
+  const stop = () => { clearInterval(timer); timer = null; };
+  slider.addEventListener("focusin", stop);
+  const reducedMotion = matchMedia("(prefers-reduced-motion: reduce)");
+  reducedMotion.addEventListener("change", (e) => { if (e.matches) stop(); });
+  if (!reducedMotion.matches) {
+    timer = setInterval(() => { if (!slider.matches(":hover") && slider.offsetParent) go(current() + 1); }, 4500);
+    track.addEventListener("pointerdown", stop, { once: true });
+    track.addEventListener("touchstart", stop, { once: true, passive: true });
+  }
+
+  const text = $(".about-text");
+  const wide = matchMedia("(min-width: 861px)");
+  const fit = () => {
+    const on = wide.matches && !!text;
+    slider.classList.toggle("is-fitted", on);
+    slider.style.height = on ? text.offsetHeight + "px" : "";
+    track.scrollLeft = current() * track.clientWidth;
+  };
+  if (text && "ResizeObserver" in window) new ResizeObserver(fit).observe(text);
+  wide.addEventListener("change", fit);
+  fit();
+}
+
+/* ---------- two views in one page: "#salon" and the salon sections show the salon view ---------- */
+function initViews() {
+  const salonIds = ["salon", "sobre", "servicios", "galeria", "gift", "faq", "visita"];
+  const reservas = $("#view-reservas"), salon = $("#view-salon");
+  let routed = null;
+  function route(id) {
+    if (typeof id !== "string") id = location.hash.slice(1);
+    routed = location.hash;
+    const toSalon = salonIds.includes(id);
+    reservas.hidden = toSalon; salon.hidden = !toSalon;
+    const target = id && id !== "salon" && id !== "reservas" ? document.getElementById(id) : null;
+    if (target) target.scrollIntoView(); else window.scrollTo(0, 0);
+  }
+  addEventListener("hashchange", () => route());
+  // Back from the booking sheet keeps the address: nothing to route then
+  addEventListener("popstate", () => { if (location.hash !== routed) route(); });
+  // handle in-page links ourselves so they also work inside embedded previews;
+  // switching views adds a history entry so "back" returns to the other view
+  document.addEventListener("click", (e) => {
+    const a = e.target.closest && e.target.closest('a[href^="#"]');
+    if (!a) return;
+    const id = a.getAttribute("href").slice(1);
+    if (!id) return;
+    e.preventDefault();
+    const switching = salonIds.includes(id) !== reservas.hidden;
+    try { history[switching ? "pushState" : "replaceState"](null, "", "#" + id); } catch {}
+    route(id);
+  });
+  route();
+}
+
+/* ---------- data ---------- */
+function applyData(d) {
+  DATA = d;
+  SETTINGS = { ...SEED.settings, ...d.settings };
+  DATA.settings = SETTINGS;
+  SERVICES = [...d.services].sort((a, b) => a.sort - b.sort);
+  CATEGORIES = [...d.categories].sort((a, b) => a.sort - b.sort || a.name.localeCompare(b.name));
+  renderCatalog();
+  renderCategoryCards();
+  renderGallery();
+  renderPayFaq();
+  renderReviews();
+  renderPolicies();
+  renderStatus();
+  renderHours();
+  wireWhatsAppLinks();
+  renderMe();
+  paintPrices();
+}
+
+let loading = null;
+function loadData() {
+  loading ||= DB.then((db) => db.loadPublic().then((d) => {
+    if (db.mode !== "demo") saved.set(PUBLIC_CACHE, { ...d, busy: [] });
+    applyData(d);
+  })).finally(() => { loading = null; });
+  return loading;
+}
+
+/* ---------- boot ---------- */
+initTheme();
+initViews();
+initReservas();
+initSalon();
+initCurrency();
+wireWhatsAppLinks();
+const cachedData = saved.get(PUBLIC_CACHE);
+if (cachedData && CFG.supabaseUrl) applyData(cachedData);
+loadData().catch(() => {
+  if (DATA) return;
+  $("#services").innerHTML = `<p class="loading">No pudimos cargar los servicios. Revisá tu conexión y recargá la página, o <a data-wa href="#">escribile a Mica</a>.</p>`;
+  wireWhatsAppLinks();
+});
+setInterval(renderStatus, 60000);
